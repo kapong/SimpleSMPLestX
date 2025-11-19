@@ -1,0 +1,11 @@
+torch
+torchvision
+torchaudio
+pytorch-lightning
+ultralytics
+einops
+timm
+
+
+trimesh
+pyrender

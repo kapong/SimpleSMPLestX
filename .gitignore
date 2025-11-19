@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints
+.vscode/
+
+# Ignore environment files
+.env
+
+# Ignore model weights and logs
+weights/
+examples/
+outputs/
