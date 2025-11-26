@@ -224,6 +224,15 @@ def rotation_matrix_to_quaternion(rotation_matrix, eps=1e-6):
 
 def rot6d_to_axis_angle(x):
     batch_size = x.shape[0]
+    
+    # Handle both (B, 6) and (B, N, 6) shapes
+    if len(x.shape) == 3:
+        num = x.shape[1]
+        x = rearrange(x, 'b n d -> (b n) d', d=6)
+        reshape_output = True
+    else:
+        num = 1
+        reshape_output = False
 
     x = x.view(-1, 3, 2)
     a1 = x[:, :, 0]
@@ -233,10 +242,16 @@ def rot6d_to_axis_angle(x):
     b3 = torch.linalg.cross(b1, b2)
     rot_mat = torch.stack((b1, b2, b3), dim=-1)  # 3x3 rotation matrix
 
-    rot_mat = torch.cat([rot_mat, torch.zeros((batch_size, 3, 1)).cuda().float()], 2)  # 3x4 rotation matrix
+    rot_mat = torch.cat([rot_mat, torch.zeros((rot_mat.shape[0], 3, 1), device=x.device, dtype=x.dtype)], 2)  # 3x4 rotation matrix
     axis_angle = rotation_matrix_to_angle_axis(rot_mat).reshape(-1, 3)  # axis-angle 
     axis_angle[torch.isnan(axis_angle)] = 0.0
+    
+    # Reshape back to (B, N, 3) if input was 3D
+    if reshape_output:
+        axis_angle = axis_angle.reshape(batch_size, num, 3)
+    
     return axis_angle
+
 
 def rot6d_to_rotmat(x):
     """Convert 6D rotation representation to 3x3 rotation matrix.
@@ -253,8 +268,7 @@ def rot6d_to_rotmat(x):
             x = rearrange(x, 'b n d -> (b n) d', d=6)
         else:
             num = 1
-        x = rearrange(x, 'b (k l) -> b k l', k=3, l=2)
-        # x = x.view(-1,3,2)
+        x = x.reshape(-1, 2, 3).permute(0, 2, 1).contiguous()
         a1 = x[:, :, 0]
         a2 = x[:, :, 1]
         b1 = F.normalize(a1)
@@ -265,7 +279,7 @@ def rot6d_to_rotmat(x):
         if num > 1:
             mat = rearrange(mat, '(b n) h w-> b n h w', b=batch_size, n=num, h=3, w=3)
     else:
-        x = x.view(-1,3,2)
+        x = x.reshape(-1, 2, 3).permute(0, 2, 1).contiguous()
         a1 = x[:, :, 0]
         a2 = x[:, :, 1]
         b1 = F.normalize(a1)
@@ -289,6 +303,58 @@ def batch_rodrigues(theta):
     v_sin = torch.sin(angle)
     quat = torch.cat([v_cos, v_sin * normalized], dim = 1)
     return quat_to_rotmat(quat)
+    
+def aa_to_rotmat(theta: torch.Tensor):
+    """
+    Convert axis-angle representation to rotation matrix.
+    Works by first converting it to a quaternion.
+    Args:
+        theta (torch.Tensor): Tensor of shape (B, 3) containing axis-angle representations.
+    Returns:
+        torch.Tensor: Corresponding rotation matrices with shape (B, 3, 3).
+    """
+    norm = torch.norm(theta + 1e-8, p = 2, dim = 1)
+    angle = torch.unsqueeze(norm, -1)
+    normalized = torch.div(theta, angle)
+    angle = angle * 0.5
+    v_cos = torch.cos(angle)
+    v_sin = torch.sin(angle)
+    quat = torch.cat([v_cos, v_sin * normalized], dim = 1)
+    return quat_to_rotmat(quat)
+
+def rotmat_to_aa(rotmat):
+    """
+    Convert rotation matrix to axis-angle representation.
+    Works by first converting it to a quaternion.
+    Args:
+        rotmat: Tensor or array of shape (B, 3, 3) or (B, N, 3, 3) containing rotation matrices.
+    Returns:
+        torch.Tensor: Corresponding axis-angle representations with shape (B, 3) or (B, N, 3).
+    """
+    # Convert to torch tensor if numpy array
+    if isinstance(rotmat, np.ndarray):
+        rotmat = torch.from_numpy(rotmat)
+    
+    # Handle both 3D (B, 3, 3) and 4D (B, N, 3, 3) inputs
+    original_shape = rotmat.shape
+    if len(original_shape) == 4:
+        # Reshape (B, N, 3, 3) -> (B*N, 3, 3)
+        batch_size, num_joints = original_shape[0], original_shape[1]
+        rotmat = rotmat.reshape(batch_size * num_joints, 3, 3)
+        reshape_output = True
+    else:
+        batch_size = rotmat.shape[0]
+        reshape_output = False
+    
+    # Add the fourth column of zeros to make it (B, 3, 4) or (B*N, 3, 4) for the conversion function
+    rotmat_3x4 = torch.cat([rotmat, torch.zeros((rotmat.shape[0], 3, 1), device=rotmat.device, dtype=rotmat.dtype)], dim=2)
+    axis_angle = rotation_matrix_to_angle_axis(rotmat_3x4)
+    
+    # Reshape back to (B, N, 3) if input was 4D
+    if reshape_output:
+        axis_angle = axis_angle.reshape(batch_size, num_joints, 3)
+    
+    return axis_angle
 
 def quat_to_rotmat(quat):
     """Convert quaternion coefficients to rotation matrix.

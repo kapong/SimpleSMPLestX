@@ -17,10 +17,9 @@ import smplx
 from tqdm.auto import tqdm
 from typing import Dict, Tuple, Optional
 
-
-class SMPLX_Video:
+class SMPLXRenderer:
     """
-    A class for rendering SMPLX model parameters into video sequences.
+    A class for rendering SMPLX model parameters into images and video sequences.
     
     Uses a singleton pattern for the SMPLX layer to avoid repeated model loading.
     """
@@ -45,7 +44,7 @@ class SMPLX_Video:
         device: str = 'cuda'
     ):
         """
-        Initialize SMPLX_Video renderer.
+        Initialize SMPLXRenderer.
         
         Args:
             model_path: Path to SMPLX model files
@@ -67,7 +66,7 @@ class SMPLX_Video:
         """
         current_config = (self.model_path, self.gender, self.device)
         
-        if SMPLX_Video._smplx_layer is None or SMPLX_Video._model_config != current_config:
+        if SMPLXRenderer._smplx_layer is None or SMPLXRenderer._model_config != current_config:
             layer_args = {
                 'create_global_orient': False,
                 'create_body_pose': False,
@@ -78,24 +77,127 @@ class SMPLX_Video:
                 'create_reye_pose': False,
                 'create_betas': False,
                 'create_expression': False,
-                'create_transl': False
+                'create_transl': False,
+                'flat_hand_mean': True,
             }
             
-            SMPLX_Video._smplx_layer = smplx.create(
+            SMPLXRenderer._smplx_layer = smplx.create(
                 self.model_path,
                 'smplx',
                 gender=self.gender,
                 use_pca=False,
-                use_face_contour=False,
+                use_face_contour=True,
+                ext='npz',
                 **layer_args
             ).to(self.device)
             
-            SMPLX_Video._model_config = current_config
+            SMPLXRenderer._model_config = current_config
     
     @property
     def smplx_layer(self):
         """Get the singleton SMPLX layer."""
-        return SMPLX_Video._smplx_layer
+        return SMPLXRenderer._smplx_layer
+    
+    def create_frame(
+        self,
+        params: Dict[str, torch.Tensor],
+        frame_idx: int = 0,
+        resolution: Tuple[int, int] = (1024, 1024),
+        camera_pose: Optional[np.ndarray] = None,
+        yfov: Optional[float] = None
+    ) -> np.ndarray:
+        """
+        Create a single rendered frame from SMPLX parameters.
+        
+        Args:
+            params: Dictionary containing SMPLX parameters:
+                - smplx_shape: Shape parameters (N, 10)
+                - smplx_body_pose: Body pose parameters (N, 63)
+                - smplx_rhand_pose: Right hand pose (N, 45)
+                - smplx_lhand_pose: Left hand pose (N, 45)
+                - smplx_jaw_pose: Jaw pose (N, 3)
+                - smplx_expr: Expression parameters (N, 10)
+            frame_idx: Index of the frame to render
+            resolution: Image resolution (width, height)
+            camera_pose: Camera pose matrix (4x4)
+            yfov: Vertical field of view in radians
+        
+        Returns:
+            Rendered frame as BGR numpy array
+        """
+        # Use default camera settings if not provided
+        camera_pose = camera_pose if camera_pose is not None else self.DEFAULT_CAMERA_POSE
+        yfov = yfov if yfov is not None else self.DEFAULT_YFOV
+        
+        # Setup rendering scene
+        scene = self._setup_scene(camera_pose, yfov)
+        renderer = pyrender.OffscreenRenderer(
+            viewport_width=resolution[0],
+            viewport_height=resolution[1]
+        )
+        
+        try:
+            # Generate mesh for the frame
+            mesh = self._generate_mesh(params, frame_idx)
+            
+            # Render the frame
+            mesh_pyrender = pyrender.Mesh.from_trimesh(mesh, smooth=True)
+            scene.add(mesh_pyrender)
+            
+            color, _ = renderer.render(scene)
+            frame_bgr = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
+            
+            return frame_bgr
+        
+        finally:
+            # Cleanup resources
+            renderer.delete()
+    
+    def _generate_mesh(
+        self,
+        params: Dict[str, torch.Tensor],
+        frame_idx: int
+    ) -> trimesh.Trimesh:
+        """
+        Generate a trimesh object from SMPLX parameters for a specific frame.
+        
+        Args:
+            params: Dictionary containing SMPLX parameters (optional keys will default to zeros)
+            frame_idx: Index of the frame to generate
+        
+        Returns:
+            Trimesh object with centered vertices
+        """
+        # Prepare zero pose tensor
+        zero_pose = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
+        
+        # Helper function to get parameter or default zeros
+        def get_param(key: str, default_shape: Tuple[int, ...]) -> torch.Tensor:
+            if key in params and params[key] is not None:
+                return params[key][frame_idx:frame_idx+1, :]
+            return torch.zeros((1, default_shape[-1]), dtype=torch.float32, device=self.device)
+        
+        # Generate SMPLX output for current frame
+        smplx_output = self.smplx_layer(
+            betas=get_param('smplx_shape', (1, 10)),
+            body_pose=get_param('smplx_body_pose', (1, 63)),
+            right_hand_pose=get_param('smplx_rhand_pose', (1, 45)),
+            left_hand_pose=get_param('smplx_lhand_pose', (1, 45)),
+            jaw_pose=get_param('smplx_jaw_pose', (1, 3)),
+            expression=get_param('smplx_expr', (1, 10)),
+            global_orient=zero_pose,
+            transl=zero_pose,
+            leye_pose=zero_pose,
+            reye_pose=zero_pose,
+            return_full_pose=True
+        )
+        
+        # Process mesh
+        vertices = smplx_output.vertices.detach().cpu().numpy().squeeze()
+        mesh = trimesh.Trimesh(vertices, self.smplx_layer.faces)
+        mesh.vertices -= mesh.center_mass
+        
+        return mesh
     
     def create_video(
         self,
@@ -141,9 +243,6 @@ class SMPLX_Video:
             viewport_height=resolution[1]
         )
         
-        # Prepare zero pose tensor
-        zero_pose = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
-        
         # Render frames
         mesh_node = None
         last_frame = None
@@ -151,24 +250,8 @@ class SMPLX_Video:
         
         try:
             for frame_idx in tqdm(range(num_frames), desc="Rendering frames"):
-                # Generate SMPLX output for current frame
-                smplx_output = self.smplx_layer(
-                    betas=params['smplx_shape'][frame_idx:frame_idx+1, :],
-                    body_pose=params['smplx_body_pose'][frame_idx:frame_idx+1, :],
-                    right_hand_pose=params['smplx_rhand_pose'][frame_idx:frame_idx+1, :],
-                    left_hand_pose=params['smplx_lhand_pose'][frame_idx:frame_idx+1, :],
-                    jaw_pose=params['smplx_jaw_pose'][frame_idx:frame_idx+1, :],
-                    expression=params['smplx_expr'][frame_idx:frame_idx+1, :],
-                    global_orient=zero_pose,
-                    transl=zero_pose,
-                    leye_pose=zero_pose,
-                    reye_pose=zero_pose,
-                )
-                
-                # Process mesh
-                vertices = smplx_output.vertices.detach().cpu().numpy().squeeze()
-                mesh = trimesh.Trimesh(vertices, self.smplx_layer.faces)
-                mesh.vertices -= mesh.center_mass
+                # Generate mesh for the frame
+                mesh = self._generate_mesh(params, frame_idx)
                 
                 # Update scene with new mesh
                 mesh_pyrender = pyrender.Mesh.from_trimesh(mesh, smooth=True)

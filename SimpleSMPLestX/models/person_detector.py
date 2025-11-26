@@ -6,7 +6,7 @@ import torch
 import torchvision.transforms.v2 as T
 import torchvision.transforms.functional as F
 
-def ResizePad(target_size):
+def ResizePad(target_size, antialias=True):
     def _resize_pad_transform(image):
         # target_size: (height, width)
         h, w = image.shape[-2:]
@@ -15,7 +15,7 @@ def ResizePad(target_size):
         scale = min(target_w / w, target_h / h)
         new_h, new_w = int(h * scale), int(w * scale)
         
-        image = T.functional.resize(image, (new_h, new_w), antialias=True)
+        image = T.functional.resize(image, (new_h, new_w), antialias=antialias)
         
         pad_l = (target_w - new_w) // 2
         pad_t = (target_h - new_h) // 2
@@ -29,7 +29,14 @@ def ResizePad(target_size):
 default_body_transform = T.Compose([
     T.ToImage(),
     T.ToDtype(torch.float32, scale=True),
-    ResizePad((512, 384))
+    ResizePad((512, 384), antialias=False),
+])
+
+default_hand_transform = T.Compose([
+    T.ToImage(),
+    T.ToDtype(torch.float32, scale=True),
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ResizePad((256,256), antialias=False),
 ])
 
 class PersonDetectAndCrop:
@@ -60,7 +67,10 @@ class PersonDetectAndCrop:
         img_path: Union[str, np.ndarray],
         person_conf: float = 0.25, 
         hand_conf: float = 0.3,
-        padding: int = 20
+        padding: int = 20,
+        hand_padding_factor: float = 2.3,
+        person_aspect_ratio: Optional[float] = 384/512.0,
+        hand_aspect_ratio: Optional[float] = 256/256.0,
     ) -> List[Dict[str, Any]]:
         """
         Detect persons and their hands in an image.
@@ -70,6 +80,9 @@ class PersonDetectAndCrop:
             person_conf: Confidence threshold for person detection.
             hand_conf: Confidence threshold for hand detection.
             padding: Padding around person crop.
+            hand_padding_factor: Factor to multiply hand detection size for padding (default 2.0 = total size is at least twice the detection).
+            person_aspect_ratio: Target aspect ratio (w/h) for person crop. If provided, expands detection box to match this ratio.
+            hand_aspect_ratio: Target aspect ratio (w/h) for hand crop. If provided, expands detection box to match this ratio.
 
         Returns:
             List of dicts for each person:
@@ -113,6 +126,25 @@ class PersonDetectAndCrop:
             # Get person keypoints if available
             person_keypoints = self._extract_keypoints(person_pred.keypoints, idx)
             
+            # Expand to target aspect ratio if specified
+            if person_aspect_ratio is not None:
+                box_w = x2 - x1
+                box_h = y2 - y1
+                current_ratio = box_w / box_h
+                
+                if current_ratio < person_aspect_ratio:
+                    # Need to expand width
+                    target_w = int(box_h * person_aspect_ratio)
+                    expand_w = (target_w - box_w) // 2
+                    x1 = x1 - expand_w
+                    x2 = x2 + expand_w
+                else:
+                    # Need to expand height
+                    target_h = int(box_w / person_aspect_ratio)
+                    expand_h = (target_h - box_h) // 2
+                    y1 = y1 - expand_h
+                    y2 = y2 + expand_h
+            
             # Add padding
             x1_pad = max(0, x1 - padding)
             y1_pad = max(0, y1 - padding)
@@ -148,7 +180,7 @@ class PersonDetectAndCrop:
             device=self.device
         )
         
-        # 4. Extract hand crops and keypoints for each person
+        # 4. Extract hand crops from full image for each person
         results = []
         for person_info, hand_out in zip(person_data, hand_results):
             result = {
@@ -160,34 +192,73 @@ class PersonDetectAndCrop:
             }
             
             if hand_out.boxes:
+                x_offset, y_offset = person_info['offset']
+                
                 for hand_idx, hand_box in enumerate(hand_out.boxes):
                     hx1, hy1, hx2, hy2 = map(int, hand_box.xyxy[0])
                     hand_class = int(hand_box.cls)
                     
-                    # Ensure coordinates are within bounds
-                    ph, pw = person_info['crop'].shape[:2]
-                    hx1, hy1 = max(0, hx1), max(0, hy1)
-                    hx2, hy2 = min(pw, hx2), min(ph, hy2)
+                    # Expand to target aspect ratio if specified
+                    if hand_aspect_ratio is not None:
+                        hand_w = hx2 - hx1
+                        hand_h = hy2 - hy1
+                        current_ratio = hand_w / hand_h
+                        
+                        if current_ratio < hand_aspect_ratio:
+                            # Need to expand width
+                            target_w = int(hand_h * hand_aspect_ratio)
+                            expand_w = (target_w - hand_w) // 2
+                            hx1 = hx1 - expand_w
+                            hx2 = hx2 + expand_w
+                        else:
+                            # Need to expand height
+                            target_h = int(hand_w / hand_aspect_ratio)
+                            expand_h = (target_h - hand_h) // 2
+                            hy1 = hy1 - expand_h
+                            hy2 = hy2 + expand_h
                     
-                    if hx1 >= hx2 or hy1 >= hy2:
-                        continue
+                    # Calculate padding based on hand detection size
+                    hand_w = hx2 - hx1
+                    hand_h = hy2 - hy1
+                    hand_padding = int(max(hand_w, hand_h) * (hand_padding_factor - 1.0) / 2.0)
+                    
+                    # Add padding to hand crop in person crop coordinates (no clipping yet)
+                    hx1_pad = hx1 - hand_padding
+                    hy1_pad = hy1 - hand_padding
+                    hx2_pad = hx2 + hand_padding
+                    hy2_pad = hy2 + hand_padding
 
-                    # Crop hand from person image
-                    hand_crop = person_info['crop'][hy1:hy2, hx1:hx2]
+                    # Map person crop coordinates to full image coordinates
+                    full_hx1_pad = x_offset + hx1_pad
+                    full_hy1_pad = y_offset + hy1_pad
+                    full_hx2_pad = x_offset + hx2_pad
+                    full_hy2_pad = y_offset + hy2_pad
+                    
+                    # Clip to full image bounds only
+                    full_hx1_pad = max(0, full_hx1_pad)
+                    full_hy1_pad = max(0, full_hy1_pad)
+                    full_hx2_pad = min(w, full_hx2_pad)
+                    full_hy2_pad = min(h, full_hy2_pad)
+                    
+                    if full_hx1_pad >= full_hx2_pad or full_hy1_pad >= full_hy2_pad:
+                        continue
+                    
+                    # Crop hand from full image
+                    hand_crop = img[full_hy1_pad:full_hy2_pad, full_hx1_pad:full_hx2_pad]
                     
                     # Get keypoints if available
                     keypoints = self._extract_keypoints(hand_out.keypoints, hand_idx)
                     
-                    # Transform hand keypoints to hand crop coordinates
+                    # Transform hand keypoints to hand crop coordinates (relative to person crop)
                     if keypoints is not None:
-                        keypoints[:, 0] -= hx1
-                        keypoints[:, 1] -= hy1
+                        keypoints[:, 0] -= hx1_pad
+                        keypoints[:, 1] -= hy1_pad
                     
                     if hand_class == 0:  # Left hand
-                        result['left_hand_crop'] = hand_crop
+                        result['left_hand_crop'] = default_hand_transform(hand_crop[:,::-1,::-1].copy()).unsqueeze(0)     # FLIP on Left
                         result['left_hand_keypoints'] = keypoints
                     elif hand_class == 1:  # Right hand
-                        result['right_hand_crop'] = hand_crop
+                        result['right_hand_crop'] = default_hand_transform(hand_crop[:,:,::-1,].copy()).unsqueeze(0)
                         result['right_hand_keypoints'] = keypoints
             
             result['person_crop'] = default_body_transform(person_info['crop']).unsqueeze(0)
